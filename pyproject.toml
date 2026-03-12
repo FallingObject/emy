@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "emy"
+version = "2.0.0"
+description = "Memory-first agentic RAG with Ollama, web search, reflection scoring, and Markdown vault"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "openai>=1.0",
+    "faiss-cpu>=1.7",
+    "rank-bm25>=0.2",
+    "gradio>=4.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "duckduckgo-search>=6.0",
+    "httpx>=0.25",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "beautifulsoup4>=4.12",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+docs = ["pypdf>=5.0", "python-docx>=1.1"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "jupyter>=1.0"]
+
+[project.scripts]
+emy = "emy.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["emy*"]

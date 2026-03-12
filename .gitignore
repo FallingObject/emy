@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+
+# Runtime — generated artifacts (rebuildable)
+runtime/indexes/
+runtime/logs/
+
+# Keep the Markdown vault in git for auditability:
+# runtime/memory_vault/ is intentionally NOT ignored
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
