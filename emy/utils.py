@@ -89,6 +89,24 @@ def read_file_text(path: Path) -> str:
                 return "\n".join(p.text for p in doc.paragraphs)
             except ImportError:
                 return ""
+        if suffix == ".pptx":
+            try:
+                from pptx import Presentation
+                prs = Presentation(str(path))
+                parts: list[str] = []
+                for slide_num, slide in enumerate(prs.slides, 1):
+                    slide_texts: list[str] = []
+                    for shape in slide.shapes:
+                        if shape.has_text_frame:
+                            for para in shape.text_frame.paragraphs:
+                                txt = para.text.strip()
+                                if txt:
+                                    slide_texts.append(txt)
+                    if slide_texts:
+                        parts.append(f"[Slide {slide_num}]\n" + "\n".join(slide_texts))
+                return "\n\n".join(parts)
+            except ImportError:
+                return ""
     except Exception:
         return ""
     return ""

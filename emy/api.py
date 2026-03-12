@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+import io
+import tempfile
+import zipfile
+from pathlib import Path
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .orchestrator import Emy
@@ -115,6 +121,58 @@ def create_api(emy: Emy) -> FastAPI:
             cat: [{"id": e.id, "fields": e.fields} for e in es]
             for cat, es in entries.items()
         }
+
+    @api.get("/api/memory/export")
+    def export_memory():
+        """Download all vault memory as a zip archive."""
+        buf = io.BytesIO()
+        vault_dir = emy.config.vault_dir
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            if vault_dir.exists():
+                for fp in sorted(vault_dir.rglob("*")):
+                    if fp.is_file():
+                        zf.write(fp, fp.relative_to(vault_dir))
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/zip",
+            headers={"Content-Disposition": "attachment; filename=emy_memory.zip"},
+        )
+
+    @api.post("/api/memory/import")
+    async def import_memory(file: UploadFile = File(...)):
+        """Upload a memory vault zip to restore/merge memory."""
+        data = await file.read()
+        if not zipfile.is_zipfile(io.BytesIO(data)):
+            raise HTTPException(400, "Uploaded file is not a valid zip archive")
+        vault_dir = emy.config.vault_dir
+        vault_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            zf.extractall(vault_dir)
+        return {"status": "ok", "message": "Memory vault imported successfully"}
+
+    # ── file upload & ingest ──────────────────────────────────────
+
+    @api.post("/api/upload")
+    async def upload_files(files: list[UploadFile] = File(...)):
+        """Upload files (including .zip) for ingestion."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for f in files:
+                data = await f.read()
+                fname = f.filename or "unknown"
+                if fname.lower().endswith(".zip"):
+                    # Unpack zip contents into the temp dir
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+                            zf.extractall(tmp_path)
+                    except zipfile.BadZipFile:
+                        raise HTTPException(400, f"Bad zip file: {fname}")
+                else:
+                    dest = tmp_path / fname
+                    dest.write_bytes(data)
+            count = emy.ingest(tmp)
+        return {"status": "ok", "chunks": count}
 
     # ── operations ────────────────────────────────────────────────
 

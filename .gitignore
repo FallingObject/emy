@@ -34,6 +34,8 @@ htmlcov/
 # Runtime — generated artifacts (rebuildable)
 runtime/indexes/
 runtime/logs/
+ref/
+data/
 
 # Keep the Markdown vault in git for auditability:
 # runtime/memory_vault/ is intentionally NOT ignored
@@ -44,3 +46,4 @@ runtime/logs/
 *.pem
 *.key
 credentials.json
+uv.lock
