@@ -62,8 +62,8 @@ class BulkTrainRequest(BaseModel):
 
 def create_api(emy: Emy) -> FastAPI:
     api = FastAPI(
-        title="Emy v2 API",
-        version="2.0.0",
+        title="Emy v3 API",
+        version="3.0.0",
         description=(
             "Training and inference API for Emy — a memory-first agentic RAG core. "
             "Connect a stronger LLM to these endpoints to train Emy."

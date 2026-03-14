@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 import numpy as np
+import requests
 from openai import OpenAI
 
 from .config import EmyConfig
@@ -76,3 +77,39 @@ class LLMClient:
             return [m.id for m in self.client.models.list().data]
         except Exception:
             return []
+
+    def vision_extract(
+        self,
+        base64_images: list[str],
+        model: str | None = None,
+        prompt: str = (
+            "Extract ALL text content from this image. "
+            "Preserve the original structure (headings, lists, tables) as closely as possible. "
+            "Return only the extracted text, no commentary."
+        ),
+    ) -> str:
+        """Send base64-encoded images to a vision model (e.g. LLaVA) via Ollama's native API.
+
+        The OpenAI-compatible /v1 endpoint does not reliably support multi-image
+        vision, so we call the Ollama ``/api/chat`` endpoint directly.
+        """
+        vision_model = model or self.config.vision_model
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+                "images": base64_images,
+            }
+        ]
+        try:
+            resp = requests.post(
+                f"{self.config.ollama_base_url}/api/chat",
+                json={"model": vision_model, "messages": messages, "stream": False},
+                timeout=120,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("message", {}).get("content", "")
+        except Exception as exc:
+            logger.warning("Vision extraction failed: %s", exc)
+            return ""

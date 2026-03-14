@@ -17,6 +17,10 @@ class EmyConfig(BaseSettings):
     # Paths
     workdir: Path = Path("./runtime")
 
+    # Vision (placeholder — future release will use a vision-capable model)
+    vision_model: str = "llava:7b"
+    vision_fallback_enabled: bool = False
+
     # Agent behaviour
     mode: str = "deploy"  # train | deploy | locked
     max_tool_calls: int = 5

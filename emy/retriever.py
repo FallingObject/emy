@@ -11,8 +11,10 @@ from .embeddings import EmbeddingIndex
 from .llm import LLMClient
 from .types import RetrievalChunk
 from .utils import read_file_text, sliding_chunks
+from .vision import image_to_base64, render_pdf_pages
 
 logger = logging.getLogger(__name__)
+
 
 
 class HybridRetriever:
@@ -48,6 +50,16 @@ class HybridRetriever:
             if path.is_dir():
                 continue
             text = read_file_text(path)
+
+            # Vision fallback for weak PDF extraction (future: qwen2.5-vl)
+            if (
+                self.config.vision_fallback_enabled
+                and path.suffix.lower() == ".pdf"
+            ):
+                vision_text = self._vision_extract_pdf(path)
+                if vision_text.strip():
+                    text = vision_text
+
             if not text.strip():
                 continue
             for i, chunk_text in enumerate(
@@ -84,6 +96,30 @@ class HybridRetriever:
 
         logger.info("Ingested %d chunks from %s", len(chunks), corpus_dir)
         return len(chunks)
+
+    def _vision_extract_pdf(self, path: Path) -> str:
+        """Render PDF pages to images and extract text via the vision model."""
+        images = render_pdf_pages(path)
+        if not images:
+            return ""
+
+        # Process in batches of 4 pages to stay within context limits
+        batch_size = 4
+        parts: list[str] = []
+        for i in range(0, len(images), batch_size):
+            batch = images[i : i + batch_size]
+            b64_batch = [image_to_base64(img) for img in batch]
+            extracted = self.llm.vision_extract(b64_batch)
+            if extracted.strip():
+                parts.append(extracted)
+
+        result = "\n\n".join(parts)
+        if result:
+            logger.info(
+                "Vision fallback extracted %d chars from %s (%d pages)",
+                len(result), path.name, len(images),
+            )
+        return result
 
     def search(self, query: str, top_k: int | None = None) -> list[RetrievalChunk]:
         top_k = top_k or self.config.max_retrieval_hits

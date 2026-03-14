@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "emy"
-version = "2.0.0"
+version = "3.0.0"
 description = "Memory-first agentic RAG with Ollama, web search, reflection scoring, and Markdown vault"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -14,7 +14,6 @@ dependencies = [
     "faiss-cpu>=1.7",
     "rank-bm25>=0.2",
     "gradio>=4.0",
-    "streamlit>=1.30",
     "fastapi>=0.100",
     "uvicorn>=0.20",
     "duckduckgo-search>=6.0",
@@ -26,12 +25,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-docs = ["pypdf>=5.0", "python-docx>=1.1", "python-pptx>=1.0"]
+docs = ["pypdf>=5.0", "python-docx>=1.1", "python-pptx>=1.0", "pymupdf>=1.24", "Pillow>=10.0"]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "jupyter>=1.0"]
 
 [project.scripts]
 emy = "emy.cli:main"
-emy-ui = "emy.streamlit_app:main"
 
 [tool.setuptools.packages.find]
 include = ["emy*"]

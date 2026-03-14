@@ -71,6 +71,7 @@ def is_greeting(text: str) -> bool:
 
 
 def read_file_text(path: Path) -> str:
+    """Extract text content from a file.  Returns empty string for unsupported types."""
     suffix = path.suffix.lower()
     try:
         if suffix in {".txt", ".md", ".py", ".json", ".yaml", ".yml", ".csv", ".rst", ".log"}:
@@ -107,6 +108,10 @@ def read_file_text(path: Path) -> str:
                 return "\n\n".join(parts)
             except ImportError:
                 return ""
+        # Standalone image files — no text to extract, handled by vision pipeline
+        from .vision import IMAGE_EXTENSIONS
+        if suffix in IMAGE_EXTENSIONS:
+            return ""
     except Exception:
         return ""
     return ""

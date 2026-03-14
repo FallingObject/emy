@@ -19,7 +19,7 @@ def cmd_chat(args):
         print("Make sure Ollama is running: ollama serve")
         return
 
-    print(f"Emy v2 | mode={args.mode} | model={config.llm_model}")
+    print(f"Emy v3 | mode={args.mode} | model={config.llm_model}")
     print("Commands: /quit  /mode <m>  /fact <cat>=<val>  /reflect <text>  /ingest <dir>")
     print("-" * 60)
 
@@ -73,21 +73,26 @@ def cmd_chat(args):
 
 
 def cmd_serve(args):
-    from .ui import main as ui_main
+    from .gradio_app import build_demo, build_config, get_emy, CSS
 
-    # Forward args to ui main via sys.argv manipulation
-    import sys
+    import gradio as gr
 
-    sys.argv = [
-        "emy",
-        "--workdir", args.workdir,
-        "--mode", args.mode,
-        "--host", args.host,
-        "--port", str(args.port),
-    ]
+    config = build_config(
+        base_url=f"http://localhost:11434",
+        workdir=args.workdir,
+        learning_enabled=(args.mode == "train"),
+        vision_enabled=False,
+    )
     if args.model:
-        sys.argv.extend(["--model", args.model])
-    ui_main()
+        config.llm_model = args.model
+
+    demo = build_demo()
+    demo.launch(
+        server_name=args.host,
+        server_port=args.port,
+        theme=gr.themes.Soft(),
+        css=CSS,
+    )
 
 
 def cmd_ingest(args):
@@ -108,7 +113,7 @@ def cmd_status(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="emy",
-        description="Emy v2 — Memory-first agentic RAG core",
+        description="Emy v3 — Memory-first agentic RAG core",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 

@@ -150,7 +150,7 @@ class ToolExecutor:
                 url,
                 timeout=10,
                 follow_redirects=True,
-                headers={"User-Agent": "Emy/2.0"},
+                headers={"User-Agent": "Emy/3.0"},
             )
             resp.raise_for_status()
         except Exception as exc:

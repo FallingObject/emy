@@ -1,6 +1,6 @@
-# Emy v2
+# Emy v3
 
-Memory-first agentic RAG built on Ollama, web search, reflection scoring, and a human-auditable Markdown vault.
+Memory-first agentic RAG built on Ollama with web search, reflection scoring, and a human-auditable Markdown vault.
 
 Emy treats the LLM as a reasoning engine, not a state container. All persistent state lives in Markdown files on disk, compiled into FAISS + SQLite indexes for speed. The agent runs a bounded ReAct loop with tool calling, scores its own responses, and stores reflections that improve future routing.
 
@@ -9,11 +9,12 @@ Emy treats the LLM as a reasoning engine, not a state container. All persistent 
 - **Bounded agent loop** — Ollama tool calling with a max-step limit and automatic fallback if the model doesn't support tools
 - **Hybrid retrieval** — BM25 + dense (FAISS) with Reciprocal Rank Fusion merging
 - **Markdown memory vault** — facts, intents, reflections, and entities stored as autosorted Markdown (git-diffable, human-auditable)
+- **Document ingestion** — PDF, PPTX, DOCX, plain text, Markdown, Python, JSON, YAML, CSV, and ZIP archives
 - **Web search + web fetch** — DuckDuckGo search and page fetching as agent tools
 - **Reflection scoring** — LLM-as-judge evaluation (faithfulness, relevance, completeness) stored as scored lessons
 - **Three modes** — `train` (active learning + scoring), `deploy` (scoring + reflections), `locked` (read-only)
 - **Training API** — FastAPI endpoints so a stronger LLM can teach Emy via HTTP
-- **Gradio UI + CLI** — both served from the same process
+- **Gradio UI + CLI** — web-based chat interface with knowledge studio, plus a terminal chat
 
 ## Architecture
 
@@ -22,14 +23,14 @@ User --> Gradio UI / CLI / API
             |
        Orchestrator (bounded ReAct loop)
             |
-    +-------+-------+-------+
-    |       |       |       |
-  Memory  Docs    Web     Web
-  Search  Search  Search  Fetch
-    |       |       |       |
-    +---+---+---+---+-------+
+    +-------+-------+-------+-------+
+    |       |       |       |       |
+  Memory  Docs    Web     Web    (Future:
+  Search  Search  Search  Fetch   Vision)
+    |       |       |       |       |
+    +---+---+---+---+-------+---+---+
         |
-    Evidence Pack --> LLM (Ollama, tool calling)
+    Evidence Pack --> LLM (qwen2.5:7b via Ollama, tool calling)
         |
     Answer + Attributions
         |
@@ -38,6 +39,18 @@ User --> Gradio UI / CLI / API
     Markdown Vault + FAISS Index + Episode Log
 ```
 
+## Supported file types
+
+| Type | Extensions | Text extraction |
+|------|-----------|----------------|
+| PDF | `.pdf` | pypdf |
+| PowerPoint | `.pptx` | python-pptx |
+| Word | `.docx` | python-docx |
+| Plain text | `.txt` `.md` `.py` `.json` `.yaml` `.csv` `.rst` `.log` | Direct read |
+| Archives | `.zip` | Auto-extracted |
+
+> **Vision (future):** A future release will add a vision-capable model for image analysis, scanned-PDF OCR, and visual document understanding. The `vision.py` module contains placeholders for this functionality.
+
 ## Project structure
 
 ```text
@@ -45,6 +58,7 @@ emy/
   __init__.py          # exports Emy, EmyConfig
   config.py            # pydantic-settings with EMY_* env vars
   llm.py               # Ollama via OpenAI SDK (chat + embeddings)
+  vision.py            # vision extraction placeholders (future release)
   vault.py             # Markdown vault with deterministic autosort
   embeddings.py        # FAISS + SQLite (WAL) vector index
   retriever.py         # hybrid BM25 + dense retrieval with RRF
@@ -52,25 +66,16 @@ emy/
   scoring.py           # LLM-as-judge reflection scoring
   orchestrator.py      # bounded ReAct agent loop
   api.py               # FastAPI training + inference endpoints
-  ui.py                # Gradio UI
+  gradio_app.py        # Gradio UI with chat, knowledge studio, sessions
   cli.py               # CLI: chat, serve, ingest, status
   types.py             # pydantic models
   utils.py             # shared utilities
-tests/
-  test_core.py         # unit tests (no Ollama required)
-notebooks/
-  01_quickstart.ipynb   # Colab-ready quickstart
-data/
-  sample_docs/          # example corpus for ingestion
-runtime/                # generated at runtime
-  memory_vault/         # Markdown vault (source of truth)
-    facts.md
-    intents.md
-    reflections.md
-    entities.md
-    index.md
-  indexes/              # FAISS + SQLite (rebuildable)
-  logs/                 # JSONL episode log
+ref/
+  create_presentation.py  # PowerPoint slide generator
+runtime/                  # generated at runtime
+  memory_vault/           # Markdown vault (source of truth)
+  indexes/                # FAISS + SQLite (rebuildable)
+  logs/                   # JSONL episode log
 ```
 
 ## Install
@@ -92,12 +97,14 @@ git clone https://github.com/FallingObject/emy.git
 cd emy
 pip install -e .
 
-# With PDF/DOCX support:
+# With full document support (recommended):
 pip install -e ".[docs]"
 
 # With dev tools (pytest, jupyter):
 pip install -e ".[dev]"
 ```
+
+The `[docs]` extra installs `pypdf`, `python-docx`, `python-pptx`, `pymupdf`, and `Pillow` for full document processing.
 
 ## Quick start
 
@@ -109,15 +116,14 @@ emy chat --mode train
 
 Commands inside the chat: `/quit`, `/mode <train|deploy|locked>`, `/fact category=value`, `/reflect <lesson>`, `/ingest <dir>`, `/status`
 
-### Gradio UI + API server
+### Gradio UI
 
 ```bash
 emy serve --mode train --port 7860
 ```
 
 - Gradio UI: `http://localhost:7860`
-- API docs: `http://localhost:7860/docs`
-- Training API: `http://localhost:7860/api/train/bulk`
+- Features: persistent sessions, drag-and-drop file uploads, streaming replies, knowledge studio, memory management
 
 ### Ingest documents
 
@@ -146,6 +152,15 @@ print(resp.score)       # faithfulness, relevance, completeness
 | `train` | facts, intents, reflections, episodes | yes | Active learning, teaching Emy |
 | `deploy` | reflections, episodes | yes | Production with self-improvement |
 | `locked` | none | no | Stable deployment, no disk writes |
+
+## Agent tools
+
+| Tool | Description |
+|------|-------------|
+| `search_memory` | Search the persistent memory vault (facts, reflections, entities) |
+| `search_documents` | Search indexed local documents via hybrid BM25 + dense retrieval |
+| `web_search` | Search the web via DuckDuckGo for current information |
+| `web_fetch` | Fetch and read the text content of a web page |
 
 ## Training API
 
@@ -187,12 +202,15 @@ httpx.post(f"{API}/api/train/feedback", json={
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/chat` | Chat with Emy |
+| POST | `/api/upload` | Upload files for ingestion |
 | POST | `/api/train/example` | Add a labeled intent example |
 | POST | `/api/train/feedback` | Add a reflection/lesson |
 | POST | `/api/train/bulk` | Bulk add examples + facts + reflections |
 | POST | `/api/memory/facts` | Add a fact |
 | POST | `/api/memory/entities` | Add an entity |
 | GET | `/api/memory/vault/{file}` | Read vault file entries |
+| GET | `/api/memory/export` | Download memory vault as ZIP |
+| POST | `/api/memory/import` | Import memory vault from ZIP |
 | POST | `/api/ingest` | Ingest a document corpus |
 | POST | `/api/mode` | Switch mode (train/deploy/locked) |
 | GET | `/api/status` | System status |
@@ -212,10 +230,6 @@ All settings can be overridden with `EMY_` environment variables or passed to `E
 | `max_web_results` | `3` | `EMY_MAX_WEB_RESULTS` |
 | `max_fetch_chars` | `4000` | `EMY_MAX_FETCH_CHARS` |
 
-## Colab
-
-The notebook at `notebooks/01_quickstart.ipynb` auto-installs Ollama on Colab and walks through the full train-to-deploy flow. Use `qwen2.5:3b` if the free tier runs out of GPU memory.
-
 ## Known issues and mitigations
 
 ### Tool calling model compatibility
@@ -233,7 +247,7 @@ FAISS indexes are tied to the embedding dimension. Switching from `nomic-embed-t
 
 ### DuckDuckGo rate limiting
 
-`duckduckgo-search` has no API key and can be rate-limited, especially on shared Colab IPs. When this happens, `web_search` returns an error message and the agent continues with other tools.
+`duckduckgo-search` has no API key and can be rate-limited, especially on shared IPs. When this happens, `web_search` returns an error message and the agent continues with other tools.
 
 **Mitigation**: exception handling returns a graceful error string to the LLM, which can proceed without web results.
 
@@ -269,15 +283,13 @@ Reflections accumulate without pruning. Over many sessions the vault and memory 
 
 ## Roadmap
 
+- [ ] **Vision integration** — add a vision-capable model for image analysis, scanned-PDF OCR, and visual document understanding (placeholder in `vision.py`)
 - [ ] **Embedding migration command** — `emy migrate-embeddings` to re-embed all vault entries when switching models
 - [ ] **Reflection pruning** — age out low-score reflections or merge similar ones
 - [ ] **Cross-encoder reranker** — optional BGE reranker for top-k refinement after hybrid retrieval
 - [ ] **Async scoring** — run reflection scoring in background to halve response latency
 - [ ] **API authentication** — token-based auth for the training endpoints
 - [ ] **Multi-user sessions** — per-user memory namespaces
-- [ ] **Streaming responses** — SSE streaming from the Gradio UI and API
-- [ ] **Intent router upgrade** — use memory index embeddings for nearest-centroid routing instead of heuristics
-- [ ] **RAGAS evaluation harness** — automated benchmarking of retrieval + generation quality
 - [ ] **Configurable tool set** — enable/disable tools per deployment (e.g., no web access in air-gapped environments)
 
 ## Running tests

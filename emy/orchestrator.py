@@ -4,7 +4,7 @@ import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from .config import EmyConfig
 from .embeddings import EmbeddingIndex
@@ -30,11 +30,12 @@ Guidelines:
 - Cite your sources when using retrieved information.
 - If you don't have enough information, say so honestly.
 - Keep responses clear, practical, and grounded in evidence.
-{memory_context}"""
+{memory_context}
+{attachment_context}"""
 
 
 class Emy:
-    """Main Emy v2 orchestrator — bounded ReAct agent loop."""
+    """Main Emy v3 orchestrator — bounded ReAct agent loop."""
 
     def __init__(self, config: Optional[EmyConfig] = None):
         self.config = config or EmyConfig()
@@ -50,7 +51,8 @@ class Emy:
         self.tools = ToolExecutor(self.config, self.memory_index, self.retriever)
         self.scorer = ReflectionScorer(self.llm)
 
-        self.sessions: dict[str, list[dict]] = defaultdict(list)
+        self.sessions: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.session_attachments: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.mode: str = self.config.mode
 
     def _setup_dirs(self) -> None:
@@ -62,35 +64,77 @@ class Emy:
         ):
             d.mkdir(parents=True, exist_ok=True)
 
-    # ── main entry point ──────────────────────────────────────────────
-
     def respond(
         self,
         query: str,
         session_id: str = "default",
         mode: str | None = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
     ) -> AgentResponse:
         mode = mode or self.mode
         trace: list[str] = [f"mode={mode}"]
 
+        attachments = attachments or []
+        if attachments:
+            self._remember_attachments(session_id, attachments)
+            trace.append(f"attachments={len(attachments)}")
+
         # Greeting fast-path
-        if is_greeting(query):
+        if is_greeting(query) and not attachments:
             answer = "Hello! I'm Emy, your memory-first research assistant. How can I help you?"
             trace.append("route=greeting (heuristic)")
-            self._log_episode(session_id, query, answer, "greeting", [], None, mode)
+            self._log_episode(
+                session_id=session_id,
+                query=query,
+                answer=answer,
+                route="greeting",
+                tools_used=[],
+                score=None,
+                mode=mode,
+                attachments=attachments,
+            )
             return AgentResponse(answer=answer, trace=trace)
 
-        # Build memory context for the system prompt
+        # Build prompt context
         memory_ctx = self._build_memory_context(query)
-        system = SYSTEM_PROMPT.format(memory_context=memory_ctx)
+        attachment_ctx = self._build_attachment_context(session_id)
+        system = SYSTEM_PROMPT.format(
+            memory_context=memory_ctx,
+            attachment_context=attachment_ctx,
+        )
 
-        # Conversation history
         history = self.sessions[session_id][-(self.config.session_history_turns * 2) :]
-        messages: list[dict] = [{"role": "system", "content": system}]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
         messages.extend(history)
         messages.append({"role": "user", "content": query})
 
-        # ── bounded tool-calling loop ─────────────────────────────────
+        # Force initial document retrieval for attachment-driven requests
+        forced_doc_results: list[Any] = []
+        if self._looks_like_attachment_query(query, attachments):
+            trace.append("attachment_route=forced_search_documents")
+            try:
+                doc_query = self._build_attachment_search_query(query, attachments)
+                forced_doc_results = self.retriever.search(doc_query)
+            except Exception as exc:
+                logger.warning("Forced attachment retrieval failed: %s", exc)
+                trace.append(f"forced_doc_search_error={exc}")
+
+        if forced_doc_results:
+            evidence_text = "\n\n".join(
+                f"[Source: {r.source}]\n{r.text}" for r in forced_doc_results[:4]
+            )
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Relevant document excerpts from the user's attached files:\n\n"
+                        f"{evidence_text}\n\n"
+                        "Use these excerpts first when answering the user's request. "
+                        "If they are insufficient, you may still use tools."
+                    ),
+                }
+            )
+
         tools_used: list[str] = []
         evidence_parts: list[str] = []
         answer = ""
@@ -99,26 +143,68 @@ class Emy:
             try:
                 response = self.llm.chat(messages, tools=TOOL_DEFINITIONS)
             except Exception as exc:
-                # Model may not support tool calling — fall back to plain chat
                 logger.warning("Tool-calling failed, falling back to plain chat: %s", exc)
                 trace.append(f"tool_fallback={exc}")
-                response = self.llm.chat_plain(messages)
+                try:
+                    response = self.llm.chat_plain(messages)
+                except Exception as plain_exc:
+                    logger.error("Plain chat also failed: %s", plain_exc)
+                    trace.append(f"plain_chat_error={plain_exc}")
+                    answer = (
+                        "I couldn't reach the configured Ollama endpoint. "
+                        "Please check your Ollama base URL and make sure the server is running."
+                    )
+                    self._log_episode(
+                        session_id=session_id,
+                        query=query,
+                        answer=answer,
+                        route="connection_error",
+                        tools_used=tools_used,
+                        score=None,
+                        mode=mode,
+                        attachments=attachments,
+                    )
+                    return AgentResponse(
+                        answer=answer,
+                        trace=trace,
+                        tools_used=tools_used,
+                        score=None,
+                        sources=[],
+                    )
 
             choice = response.choices[0]
 
-            # If the model wants to call tools
             if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
                 messages.append(choice.message)
+
                 for tc in choice.message.tool_calls:
                     tool_name = tc.function.name
                     try:
                         args = json.loads(tc.function.arguments)
                     except (json.JSONDecodeError, TypeError):
                         args = {}
-                    trace.append(f"tool[{step}]: {tool_name}({json.dumps(args)[:80]})")
+
+                    # Bias wrong tool choice for attachment-driven queries
+                    if (
+                        attachments
+                        and self._looks_like_attachment_query(query, attachments)
+                        and tool_name == "search_memory"
+                    ):
+                        trace.append(
+                            f"tool[{step}]: reroute search_memory -> search_documents"
+                        )
+                        tool_name = "search_documents"
+                        if not args.get("query"):
+                            args["query"] = self._build_attachment_search_query(
+                                query,
+                                attachments,
+                            )
+
+                    trace.append(f"tool[{step}]: {tool_name}({json.dumps(args)[:120]})")
                     result = self.tools.execute(tool_name, args)
                     tools_used.append(tool_name)
                     evidence_parts.append(result)
+
                     messages.append(
                         {
                             "role": "tool",
@@ -127,11 +213,9 @@ class Emy:
                         }
                     )
             else:
-                # Final answer
                 answer = choice.message.content or ""
                 break
         else:
-            # Ran out of steps — try to get a final answer
             try:
                 final = self.llm.chat_plain(messages)
                 answer = final.choices[0].message.content or ""
@@ -140,26 +224,58 @@ class Emy:
 
         trace.append(f"tools_used={tools_used}")
 
-        # ── reflection scoring ────────────────────────────────────────
+        # If forced retrieval happened, keep those excerpts for scoring context too
+        if forced_doc_results:
+            forced_evidence = "\n\n".join(
+                f"[Source: {r.source}]\n{r.text}" for r in forced_doc_results
+            )
+            evidence_parts.insert(0, forced_evidence)
+
         score: ScoringResult | None = None
-        if mode in ("train", "deploy") and tools_used:
+        if mode in ("train", "deploy") and (tools_used or forced_doc_results):
             try:
                 evidence_text = "\n".join(evidence_parts)
-                score = self.scorer.score(query, answer, evidence_text, tools_used)
+                score = self.scorer.score(
+                    query,
+                    answer,
+                    evidence_text,
+                    tools_used or ["forced_search_documents"],
+                )
                 trace.append(f"score={score.overall:.2f}")
                 if mode != "locked" and score.lesson and score.lesson.lower() != "none":
-                    self._store_reflection(query, tools_used, score)
+                    self._store_reflection(query, tools_used or ["forced_search_documents"], score)
             except Exception as exc:
                 trace.append(f"scoring_error={exc}")
 
-        # ── persist episode ───────────────────────────────────────────
-        self._log_episode(session_id, query, answer, "agent", tools_used, score, mode)
-        self.sessions[session_id].append({"role": "user", "content": query})
-        self.sessions[session_id].append({"role": "assistant", "content": answer})
+        self._log_episode(
+            session_id=session_id,
+            query=query,
+            answer=answer,
+            route="agent",
+            tools_used=tools_used or (["forced_search_documents"] if forced_doc_results else []),
+            score=score,
+            mode=mode,
+            attachments=attachments,
+        )
 
-        # ── retrieve source chunks for the response model ─────────────
+        self.sessions[session_id].append(
+            {
+                "role": "user",
+                "content": query,
+                "attachments": attachments,
+            }
+        )
+        self.sessions[session_id].append(
+            {
+                "role": "assistant",
+                "content": answer,
+            }
+        )
+
         sources = []
-        if "search_documents" in tools_used:
+        if forced_doc_results:
+            sources = forced_doc_results
+        elif "search_documents" in tools_used:
             sources = self.retriever.search(query)
 
         return AgentResponse(
@@ -170,19 +286,99 @@ class Emy:
             score=score,
         )
 
+    # ── attachment helpers ────────────────────────────────────────────
+
+    def _remember_attachments(
+        self,
+        session_id: str,
+        attachments: list[dict[str, Any]],
+        max_keep: int = 8,
+    ) -> None:
+        bucket = self.session_attachments[session_id]
+        bucket.extend(attachments)
+        self.session_attachments[session_id] = bucket[-max_keep:]
+
+    def _build_attachment_context(self, session_id: str) -> str:
+        attachments = self.session_attachments.get(session_id, [])
+        if not attachments:
+            return ""
+
+        parts = ["Recent attachments for this conversation:"]
+        for item in attachments:
+            name = item.get("name", "unknown")
+            file_type = item.get("type", "unknown")
+            size_label = item.get("size_label", "?")
+            uploaded_at = item.get("uploaded_at", "")
+            parts.append(
+                f"  - {name} ({file_type}, {size_label}, uploaded {uploaded_at})"
+            )
+
+        parts.append(
+            "Use these as recent conversation context when relevant. "
+            "Do not pretend to have read content that was not retrieved."
+        )
+        return "\n" + "\n".join(parts)
+
+    def _looks_like_attachment_query(
+        self,
+        query: str,
+        attachments: list[dict[str, Any]],
+    ) -> bool:
+        if not attachments:
+            return False
+
+        q = query.lower().strip()
+        triggers = [
+            "summarize this",
+            "summarize the attachment",
+            "summarize the file",
+            "summarize the uploaded file",
+            "read this",
+            "read the attachment",
+            "read the uploaded file",
+            "explain this file",
+            "what does this file say",
+            "what does the file say",
+            "uploaded file",
+            "attached file",
+            "this attachment",
+            "this file",
+            "summarize",
+            "analyze this",
+            "review this",
+        ]
+        return any(trigger in q for trigger in triggers)
+
+    def _build_attachment_search_query(
+        self,
+        query: str,
+        attachments: list[dict[str, Any]],
+    ) -> str:
+        if not attachments:
+            return query
+
+        names = ", ".join(a.get("name", "") for a in attachments if a.get("name"))
+        parts = [query]
+
+        if names:
+            parts.append(f"attached file names: {names}")
+
+        parts.append(
+            "Use the attached/uploaded file content as the first retrieval target."
+        )
+        return "\n".join(parts)
+
     # ── memory context builder ────────────────────────────────────────
 
     def _build_memory_context(self, query: str) -> str:
         parts: list[str] = []
 
-        # Vault facts
         facts = self.vault.all_entries("facts.md")
         if facts:
             parts.append("\nKnown facts:")
             for e in facts[:10]:
                 parts.append(f"  - [{e.category}] {e.fields.get('content', '')}")
 
-        # Top reflections by similarity
         try:
             reflections = self.memory_index.search(query, top_k=3)
             reflection_lines = [
@@ -235,9 +431,11 @@ class Emy:
         tools_used: list[str],
         score: ScoringResult | None,
         mode: str,
+        attachments: Optional[list[dict[str, Any]]] = None,
     ) -> None:
         if mode == "locked":
             return
+
         episode = {
             "id": new_id("ep"),
             "session_id": session_id,
@@ -248,6 +446,7 @@ class Emy:
             "tools_used": tools_used,
             "score": score.model_dump() if score else None,
             "mode": mode,
+            "attachments": attachments or [],
         }
         append_jsonl(self.config.logs_dir / "episodes.jsonl", episode)
 
@@ -272,7 +471,10 @@ class Emy:
         return entry_id
 
     def add_training_example(
-        self, text: str, label: str, source: str = "api"
+        self,
+        text: str,
+        label: str,
+        source: str = "api",
     ) -> str:
         entry_id = new_id("intent")
         self.vault.write_entry(
@@ -289,7 +491,10 @@ class Emy:
         return entry_id
 
     def add_reflection(
-        self, lesson: str, trigger: str = "manual", score: float = 0.5
+        self,
+        lesson: str,
+        trigger: str = "manual",
+        score: float = 0.5,
     ) -> str:
         entry_id = new_id("refl")
         self.vault.write_entry(
@@ -304,7 +509,9 @@ class Emy:
             },
         )
         self.memory_index.add(
-            [f"Reflection: {lesson}"], [entry_id], source="reflections"
+            [f"Reflection: {lesson}"],
+            [entry_id],
+            source="reflections",
         )
         return entry_id
 
@@ -333,6 +540,8 @@ class Emy:
             "ollama_healthy": self.llm.health_check(),
             "llm_model": self.config.llm_model,
             "embedding_model": self.config.embedding_model,
+            "vision_model": self.config.vision_model,
+            "vision_fallback_enabled": self.config.vision_fallback_enabled,
             "memory_entries": self.memory_index.total,
             "doc_entries": self.doc_index.total,
             "vault_files": {
@@ -341,4 +550,5 @@ class Emy:
                 "reflections": len(self.vault.all_entries("reflections.md")),
                 "entities": len(self.vault.all_entries("entities.md")),
             },
+            "active_sessions": len(self.sessions),
         }
