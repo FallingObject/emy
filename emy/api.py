@@ -2,14 +2,27 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from .jobs_runner import ResearchJobRunner
+from .jobs_store import JobStore
+from .jobs_types import (
+    InterventionResolveRequest,
+    JobCreateRequest,
+    JobSummary,
+    ResearchJobSpec,
+    ResearchJobState,
+)
+from .jobs_worker import JobsWorker
 from .orchestrator import Emy
+from .utils import new_id, now_iso
 
 
 # ── request / response models ────────────────────────────────────────
@@ -69,6 +82,27 @@ def create_api(emy: Emy) -> FastAPI:
             "Connect a stronger LLM to these endpoints to train Emy."
         ),
     )
+
+    # ── Job store + worker (lazy-init, one per API instance) ──────────
+    _job_store: JobStore | None = None
+    _worker: JobsWorker | None = None
+    _worker_lock = threading.Lock()
+
+    def _get_store() -> JobStore:
+        nonlocal _job_store
+        if _job_store is None:
+            _job_store = JobStore(emy.config.jobs_dir)
+        return _job_store
+
+    def _ensure_worker() -> None:
+        nonlocal _worker
+        with _worker_lock:
+            if _worker is None:
+                _worker = JobsWorker(emy, _get_store(), emy.config.job_poll_interval_s)
+                _worker.start_in_thread()
+
+    # Start worker when the API is created
+    _ensure_worker()
 
     # ── chat ──────────────────────────────────────────────────────
 
@@ -162,7 +196,6 @@ def create_api(emy: Emy) -> FastAPI:
                 data = await f.read()
                 fname = f.filename or "unknown"
                 if fname.lower().endswith(".zip"):
-                    # Unpack zip contents into the temp dir
                     try:
                         with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
                             zf.extractall(tmp_path)
@@ -194,5 +227,170 @@ def create_api(emy: Emy) -> FastAPI:
     @api.get("/api/status")
     def status():
         return emy.status()
+
+    # ── research jobs ─────────────────────────────────────────────
+
+    @api.post("/api/jobs")
+    def create_job(req: JobCreateRequest):
+        """Create a new research job and queue it for the background worker."""
+        if req.deadline_at:
+            deadline_at = req.deadline_at
+        else:
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=req.time_budget_s)
+            deadline_at = deadline.isoformat()
+
+        job_id = new_id("job")
+        spec = ResearchJobSpec(
+            objective=req.objective,
+            deliverable_type=req.deliverable_type,
+            deadline_at=deadline_at,
+            time_budget_s=req.time_budget_s,
+            models=req.models,
+            budgets=req.budgets,
+        )
+        state = ResearchJobState(
+            job_id=job_id,
+            spec=spec,
+            created_at=now_iso(),
+        )
+        store = _get_store()
+        store.save(state)
+        store.append_event(job_id, {"event": "job_created", "objective": req.objective[:120]})
+        return state.model_dump()
+
+    @api.get("/api/jobs")
+    def list_jobs(status: str | None = None):
+        jobs = _get_store().list_jobs(status=status)
+        return [
+            JobSummary(
+                job_id=j.job_id,
+                status=j.status,
+                phase=j.phase,
+                objective=j.spec.objective,
+                created_at=j.created_at,
+                deadline_at=j.spec.deadline_at,
+                finished_at=j.finished_at,
+                cycle=j.cycle,
+                overall_score=j.metrics.overall,
+            ).model_dump()
+            for j in jobs
+        ]
+
+    @api.get("/api/jobs/{job_id}")
+    def get_job(job_id: str):
+        try:
+            return _get_store().load(job_id).model_dump()
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+
+    @api.post("/api/jobs/{job_id}/pause")
+    def pause_job(job_id: str):
+        store = _get_store()
+        try:
+            state = store.load(job_id)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        if state.status != "running":
+            raise HTTPException(400, f"Job is {state.status!r}, cannot pause")
+        state.status = "paused"
+        store.save(state)
+        store.append_event(job_id, {"event": "job_paused"})
+        return {"status": "ok", "job_status": state.status}
+
+    @api.post("/api/jobs/{job_id}/resume")
+    def resume_job(job_id: str):
+        store = _get_store()
+        try:
+            state = store.load(job_id)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        if state.status not in ("paused", "blocked"):
+            raise HTTPException(400, f"Job is {state.status!r}, cannot resume")
+        state.status = "queued"  # re-queue so worker picks it up
+        state.blocked = None
+        store.save(state)
+        store.append_event(job_id, {"event": "job_requeued"})
+        return {"status": "ok", "job_status": state.status}
+
+    @api.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str):
+        store = _get_store()
+        try:
+            state = store.load(job_id)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        if state.status in ("completed", "failed", "canceled", "expired"):
+            raise HTTPException(400, f"Job is already terminal: {state.status!r}")
+        state.status = "canceled"
+        state.finished_at = now_iso()
+        store.save(state)
+        store.append_event(job_id, {"event": "job_canceled"})
+        return {"status": "ok", "job_status": state.status}
+
+    @api.get("/api/jobs/{job_id}/events")
+    def get_events(job_id: str, tail: int = 50):
+        if not (_get_store().jobs_dir / job_id).exists():
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        return _get_store().tail_events(job_id, n=tail)
+
+    @api.get("/api/jobs/{job_id}/artifact/{name}")
+    def get_artifact(job_id: str, name: str):
+        # Prevent path traversal
+        if "/" in name or "\\" in name or ".." in name:
+            raise HTTPException(400, "Invalid artifact name")
+        content = _get_store().read_artifact(job_id, name)
+        if not content:
+            raise HTTPException(404, f"Artifact {name!r} not found for job {job_id!r}")
+        media = "text/markdown" if name.endswith(".md") else "application/json"
+        return StreamingResponse(
+            io.BytesIO(content.encode()),
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{name}"'},
+        )
+
+    @api.get("/api/jobs/{job_id}/interventions")
+    def get_intervention(job_id: str):
+        try:
+            state = _get_store().load(job_id)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        if state.blocked is None:
+            return {"blocked": False}
+        return {"blocked": True, "intervention": state.blocked.model_dump()}
+
+    @api.post("/api/jobs/{job_id}/interventions/submit")
+    async def submit_intervention(
+        job_id: str,
+        req: InterventionResolveRequest,
+        file: UploadFile | None = File(default=None),
+    ):
+        store = _get_store()
+        try:
+            state = store.load(job_id)
+        except FileNotFoundError:
+            raise HTTPException(404, f"Job {job_id!r} not found")
+        if state.status != "blocked":
+            raise HTTPException(400, f"Job is {state.status!r}, not blocked")
+
+        # Save uploaded file as manual attachment evidence
+        if file is not None:
+            data = await file.read()
+            fname = file.filename or "manual_evidence.txt"
+            store.save_attachment(job_id, fname, data.decode(errors="ignore"))
+            store.append_event(job_id, {"event": "attachment_uploaded", "file": fname})
+        elif req.manual_content:
+            fname = req.manual_source_name or "manual_evidence.txt"
+            store.save_attachment(job_id, fname, req.manual_content)
+            store.append_event(job_id, {"event": "attachment_uploaded", "file": fname})
+
+        if req.action == "skip":
+            store.append_event(job_id, {"event": "intervention_skipped"})
+        else:
+            store.append_event(job_id, {"event": "intervention_resolved"})
+
+        state.status = "queued"
+        state.blocked = None
+        store.save(state)
+        return {"status": "ok", "job_status": state.status}
 
     return api

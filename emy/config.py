@@ -37,6 +37,15 @@ class EmyConfig(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 7860
 
+    # Job runtime
+    job_poll_interval_s: float = 2.0
+    job_checkpoint_interval_s: int = 300
+    job_max_cycles: int = 60
+    job_finalization_grace_s: int = 300
+    job_planner_model: str = ""
+    job_writer_model: str = "gemma3:12b"
+    job_critic_model: str = "deepseek-r1:8b"
+
     @property
     def vault_dir(self) -> Path:
         return self.workdir / "memory_vault"
@@ -48,3 +57,7 @@ class EmyConfig(BaseSettings):
     @property
     def indexes_dir(self) -> Path:
         return self.workdir / "indexes"
+
+    @property
+    def jobs_dir(self) -> Path:
+        return self.workdir / "jobs"

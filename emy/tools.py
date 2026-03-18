@@ -1,16 +1,55 @@
 from __future__ import annotations
 
 import logging
+import re
+from typing import Literal, Optional
 
 import httpx
 from bs4 import BeautifulSoup
 from duckduckgo_search import DDGS
+from pydantic import BaseModel
 
 from .config import EmyConfig
 from .embeddings import EmbeddingIndex
 from .retriever import HybridRetriever
 
 logger = logging.getLogger(__name__)
+
+# ── Structured web-fetch result (used by research jobs) ──────────────
+
+
+class WebFetchResult(BaseModel):
+    status: Literal["ok", "captcha", "paywall", "blocked", "error"]
+    url: str
+    http_status: Optional[int] = None
+    title: Optional[str] = None
+    text: str = ""
+    error: Optional[str] = None
+
+
+_CAPTCHA_PATTERNS = [
+    r"captcha", r"are you a human", r"verify you are human",
+    r"unusual traffic", r"robot check", r"i am not a robot",
+    r"human verification",
+]
+_PAYWALL_PATTERNS = [
+    r"subscribe to (read|continue|access)", r"subscription required",
+    r"premium content", r"sign in to read", r"members only",
+    r"unlock this article", r"create an account to continue",
+]
+
+
+def _detect_interstitial(text: str) -> Optional[str]:
+    """Return 'captcha', 'paywall', or None."""
+    lo = text.lower()
+    for pat in _CAPTCHA_PATTERNS:
+        if re.search(pat, lo):
+            return "captcha"
+    for pat in _PAYWALL_PATTERNS:
+        if re.search(pat, lo):
+            return "paywall"
+    return None
+
 
 # ── tool schemas (OpenAI function-calling format) ────────────────────
 
@@ -145,6 +184,7 @@ class ToolExecutor:
         return "\n".join(lines)
 
     def _web_fetch(self, url: str) -> str:
+        """Simple text fetch used by the chat agent (unchanged behaviour)."""
         try:
             resp = httpx.get(
                 url,
@@ -160,3 +200,52 @@ class ToolExecutor:
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
         return text[: self.config.max_fetch_chars]
+
+    def web_fetch_structured(self, url: str) -> WebFetchResult:
+        """Structured fetch used by the research job runner.
+
+        Returns a :class:`WebFetchResult` with CAPTCHA/paywall detection so the
+        runner can transition the job to ``blocked`` instead of silently failing.
+        """
+        try:
+            resp = httpx.get(
+                url,
+                timeout=10,
+                follow_redirects=True,
+                headers={"User-Agent": "Emy/3.0"},
+            )
+        except Exception as exc:
+            return WebFetchResult(status="error", url=url, error=str(exc))
+
+        http_status = resp.status_code
+        if http_status >= 400:
+            return WebFetchResult(
+                status="error", url=url, http_status=http_status,
+                error=f"HTTP {http_status}",
+            )
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        title_tag = soup.find("title")
+        title = title_tag.get_text(strip=True) if title_tag else None
+
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)[: self.config.max_fetch_chars]
+
+        interstitial = _detect_interstitial(text)
+        if interstitial:
+            return WebFetchResult(
+                status=interstitial,  # type: ignore[arg-type]
+                url=url,
+                http_status=http_status,
+                title=title,
+                text=text[:200],
+            )
+
+        return WebFetchResult(
+            status="ok",
+            url=url,
+            http_status=http_status,
+            title=title,
+            text=text,
+        )

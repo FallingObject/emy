@@ -1,6 +1,6 @@
 # Emy v3
 
-Memory-first agentic RAG built on Ollama with web search, reflection scoring, and a human-auditable Markdown vault.
+Memory-first agentic RAG built on Ollama — with a bounded ReAct loop, hybrid retrieval, LLM-as-judge self-improvement, and an autonomous multi-role research runtime.
 
 Emy treats the LLM as a reasoning engine, not a state container. All persistent state lives in Markdown files on disk, compiled into FAISS + SQLite indexes for speed. The agent runs a bounded ReAct loop with tool calling, scores its own responses, and stores reflections that improve future routing.
 
@@ -14,14 +14,15 @@ Emy treats the LLM as a reasoning engine, not a state container. All persistent 
 - **Reflection scoring** — LLM-as-judge evaluation (faithfulness, relevance, completeness) stored as scored lessons
 - **Three modes** — `train` (active learning + scoring), `deploy` (scoring + reflections), `locked` (read-only)
 - **Training API** — FastAPI endpoints so a stronger LLM can teach Emy via HTTP
-- **Gradio UI + CLI** — web-based chat interface with knowledge studio, plus a terminal chat
+- **Research jobs (TRM)** — autonomous multi-role research runtime: Planner → Researcher → Writer → Critic → Refiner, cycling until quality converges or deadline is reached
+- **Gradio UI + CLI** — web-based chat interface with knowledge studio and jobs dashboard, plus a terminal chat
 
 ## Architecture
 
 ```text
 User --> Gradio UI / CLI / API
             |
-       Orchestrator (bounded ReAct loop)
+       Orchestrator (bounded ReAct loop, ≤5 steps)
             |
     +-------+-------+-------+-------+
     |       |       |       |       |
@@ -37,6 +38,37 @@ User --> Gradio UI / CLI / API
     Reflection Scorer (LLM-as-judge)
         |
     Markdown Vault + FAISS Index + Episode Log
+```
+
+### Research job runtime (TRM)
+
+```text
+JobsWorker (daemon thread)
+    |
+    v
+ResearchJobRunner.run_until_done()
+    |
+    +-- each cycle: --+
+    |                 |
+    v                 v
+Planner          early-stop conditions:
+  → questions        - critic recommends stop
+  → outline          - quality plateau <0.02 for 3 cycles
+    |                - deadline approaching
+Researcher         - max cycles (60)
+  → web_search
+  → web_fetch
+    |
+Writer (gemma3:12b)
+  → Markdown draft + [S1] citations
+    |
+Critic (deepseek-r1:8b)
+  → grounding · coverage · clarity · timeliness
+    |
+Refiner
+  → next-cycle priorities / skip questions
+    |
+Checkpoint (every 300s)
 ```
 
 ## Supported file types
@@ -65,17 +97,21 @@ emy/
   tools.py             # search_memory, search_documents, web_search, web_fetch
   scoring.py           # LLM-as-judge reflection scoring
   orchestrator.py      # bounded ReAct agent loop
-  api.py               # FastAPI training + inference endpoints
-  gradio_app.py        # Gradio UI with chat, knowledge studio, sessions
-  cli.py               # CLI: chat, serve, ingest, status
+  api.py               # FastAPI endpoints (chat, training, memory, jobs)
+  gradio_app.py        # Gradio UI: chat, knowledge studio, jobs dashboard
+  cli.py               # CLI: chat, serve, ingest, research, jobs, worker
   types.py             # pydantic models
   utils.py             # shared utilities
-ref/
-  create_presentation.py  # PowerPoint slide generator
-runtime/                  # generated at runtime
-  memory_vault/           # Markdown vault (source of truth)
-  indexes/                # FAISS + SQLite (rebuildable)
-  logs/                   # JSONL episode log
+  jobs_types.py        # ResearchJobSpec, ResearchJobState, JobMetrics
+  jobs_roles.py        # Planner, Researcher, Writer, Critic, Refiner roles
+  jobs_store.py        # file-backed job CRUD + event log
+  jobs_runner.py       # ResearchJobRunner (TRM cycle loop)
+  jobs_worker.py       # JobsWorker background daemon
+runtime/               # generated at runtime
+  memory_vault/        # Markdown vault (source of truth)
+  indexes/             # FAISS + SQLite (rebuildable)
+  logs/                # JSONL episode log
+  jobs/                # research job state, reports, metrics, events
 ```
 
 ## Install
@@ -88,6 +124,10 @@ Ollama must be running with the required models pulled:
 # Install Ollama: https://ollama.com
 ollama pull qwen2.5:7b
 ollama pull nomic-embed-text
+
+# Optional: specialist models for research jobs
+ollama pull gemma3:12b       # writer role
+ollama pull deepseek-r1:8b   # critic role
 ```
 
 ### Install Emy
@@ -123,12 +163,34 @@ emy serve --mode train --port 7860
 ```
 
 - Gradio UI: `http://localhost:7860`
-- Features: persistent sessions, drag-and-drop file uploads, streaming replies, knowledge studio, memory management
+- Features: persistent sessions, drag-and-drop file uploads, streaming replies, knowledge studio, memory management, jobs dashboard
 
 ### Ingest documents
 
 ```bash
 emy ingest ./data/sample_docs
+```
+
+### Research jobs (CLI)
+
+```bash
+# Submit a job and return immediately
+emy research submit --objective "Summarise the state of local LLM inference" --time-budget 30m
+
+# Run blocking until the job finishes
+emy research run --objective "Compare RAG vs fine-tuning" --time-budget 1h
+
+# Monitor
+emy jobs list
+emy jobs status <job_id>
+emy jobs tail <job_id>
+
+# Control
+emy jobs cancel <job_id>
+emy jobs resume <job_id>   # after pause or intervention
+
+# Run the background worker daemon
+emy worker
 ```
 
 ### Python API
@@ -197,7 +259,9 @@ httpx.post(f"{API}/api/train/feedback", json={
 })
 ```
 
-### All API endpoints
+## All API endpoints
+
+### Chat and training
 
 | Method | Path | Purpose |
 |--------|------|---------|
@@ -215,9 +279,51 @@ httpx.post(f"{API}/api/train/feedback", json={
 | POST | `/api/mode` | Switch mode (train/deploy/locked) |
 | GET | `/api/status` | System status |
 
+### Research jobs
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/jobs` | Create a research job |
+| GET | `/api/jobs` | List jobs (optional `?status=` filter) |
+| GET | `/api/jobs/{id}` | Full job state |
+| POST | `/api/jobs/{id}/pause` | Pause a running job |
+| POST | `/api/jobs/{id}/resume` | Resume a paused or blocked job |
+| POST | `/api/jobs/{id}/cancel` | Cancel a job |
+| GET | `/api/jobs/{id}/events` | Tail the JSONL event log |
+| GET | `/api/jobs/{id}/artifact/{name}` | Download `report.md`, `sources.json`, or `metrics.json` |
+| GET | `/api/jobs/{id}/interventions` | Check if the job is blocked (CAPTCHA/paywall) |
+| POST | `/api/jobs/{id}/interventions/submit` | Upload manual evidence or skip the blocked step |
+
+### Creating a research job via API
+
+```python
+import httpx, time
+
+API = "http://localhost:7860"
+
+# Submit
+job = httpx.post(f"{API}/api/jobs", json={
+    "objective": "Survey the current state of open-source LLM inference",
+    "time_budget_s": 1800,   # 30 minutes
+    "deliverable": "report",
+}).json()
+
+job_id = job["job_id"]
+
+# Stream events
+with httpx.stream("GET", f"{API}/api/jobs/{job_id}/events") as r:
+    for line in r.iter_lines():
+        print(line)
+
+# Download finished report
+report = httpx.get(f"{API}/api/jobs/{job_id}/artifact/report.md").text
+```
+
 ## Configuration
 
 All settings can be overridden with `EMY_` environment variables or passed to `EmyConfig`:
+
+### Core settings
 
 | Setting | Default | Env var |
 |---------|---------|---------|
@@ -229,6 +335,35 @@ All settings can be overridden with `EMY_` environment variables or passed to `E
 | `max_tool_calls` | `5` | `EMY_MAX_TOOL_CALLS` |
 | `max_web_results` | `3` | `EMY_MAX_WEB_RESULTS` |
 | `max_fetch_chars` | `4000` | `EMY_MAX_FETCH_CHARS` |
+
+### Research job settings
+
+| Setting | Default | Env var |
+|---------|---------|---------|
+| `job_poll_interval_s` | `2` | `EMY_JOB_POLL_INTERVAL_S` |
+| `job_checkpoint_interval_s` | `300` | `EMY_JOB_CHECKPOINT_INTERVAL_S` |
+| `job_max_cycles` | `60` | `EMY_JOB_MAX_CYCLES` |
+| `job_planner_model` | _(llm_model)_ | `EMY_JOB_PLANNER_MODEL` |
+| `job_writer_model` | `gemma3:12b` | `EMY_JOB_WRITER_MODEL` |
+| `job_critic_model` | `deepseek-r1:8b` | `EMY_JOB_CRITIC_MODEL` |
+
+## Research job roles
+
+Each research job runs a Planner–Researcher–Writer–Critic–Refiner cycle. Each role is a separate LLM call with structured JSON output and can use a different model.
+
+| Role | Model | Responsibility |
+|------|-------|---------------|
+| Planner | `llm_model` | Creates / updates the research outline and prioritises the questions backlog |
+| Researcher | `llm_model` | Plans which web searches and fetches to execute based on open questions |
+| Writer | `gemma3:12b` | Updates the Markdown report draft using collected evidence; adds `[S1]` citation tags |
+| Critic | `deepseek-r1:8b` | Scores grounding, coverage, clarity, timeliness (0.0–1.0); recommends early stop when threshold is met |
+| Refiner | `llm_model` | Identifies priorities for the next cycle; can mark questions as skipped |
+
+Early-stop conditions (any one triggers stop):
+- Critic recommends stopping (`should_stop: true`)
+- Quality plateau — overall score improvement < 0.02 for 3 consecutive cycles
+- Deadline within grace period (300 s)
+- Max cycles reached (default 60)
 
 ## Known issues and mitigations
 
@@ -287,8 +422,8 @@ Reflections accumulate without pruning. Over many sessions the vault and memory 
 - [ ] **Embedding migration command** — `emy migrate-embeddings` to re-embed all vault entries when switching models
 - [ ] **Reflection pruning** — age out low-score reflections or merge similar ones
 - [ ] **Cross-encoder reranker** — optional BGE reranker for top-k refinement after hybrid retrieval
-- [ ] **Async scoring** — run reflection scoring in background to halve response latency
-- [ ] **API authentication** — token-based auth for the training endpoints
+- [ ] **Async reflection scoring** — run scoring in background to halve chat response latency
+- [ ] **API authentication** — token-based auth for training and job management endpoints
 - [ ] **Multi-user sessions** — per-user memory namespaces
 - [ ] **Configurable tool set** — enable/disable tools per deployment (e.g., no web access in air-gapped environments)
 

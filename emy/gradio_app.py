@@ -4,9 +4,10 @@ import io
 import json
 import secrets
 import tempfile
+import threading
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +15,104 @@ import gradio as gr
 
 try:
     from .config import EmyConfig
+    from .jobs_runner import ResearchJobRunner
+    from .jobs_store import JobStore
+    from .jobs_types import ResearchJobSpec, ResearchJobState
+    from .jobs_worker import JobsWorker
     from .orchestrator import Emy
+    from .utils import new_id, now_iso
 except ImportError:  # pragma: no cover
     from emy.config import EmyConfig
+    from emy.jobs_runner import ResearchJobRunner
+    from emy.jobs_store import JobStore
+    from emy.jobs_types import ResearchJobSpec, ResearchJobState
+    from emy.jobs_worker import JobsWorker
     from emy.orchestrator import Emy
+    from emy.utils import new_id, now_iso
+
+# ── Job-store cache (keyed by workdir) ───────────────────────────────
+_JOB_STORES: dict[str, JobStore] = {}
+_JOB_WORKERS: dict[str, JobsWorker] = {}
+_WORKER_LOCK = threading.Lock()
+
+
+def get_job_store(workdir: str) -> JobStore:
+    key = (workdir or DEFAULT_WORKDIR).strip()
+    if key not in _JOB_STORES:
+        cfg = EmyConfig(workdir=Path(key))
+        _JOB_STORES[key] = JobStore(cfg.jobs_dir)
+    return _JOB_STORES[key]
+
+
+def ensure_job_worker(workdir: str, base_url: str, learning_enabled: bool, vision_enabled: bool) -> None:
+    key = (workdir or DEFAULT_WORKDIR).strip()
+    with _WORKER_LOCK:
+        if key not in _JOB_WORKERS:
+            emy = get_emy(base_url, workdir, learning_enabled, vision_enabled)
+            store = get_job_store(workdir)
+            w = JobsWorker(emy, store, poll_interval_s=emy.config.job_poll_interval_s)
+            w.start_in_thread()
+            _JOB_WORKERS[key] = w
+
+
+# ── Jobs UI helpers ───────────────────────────────────────────────────
+
+def _parse_time_budget_ui(s: str) -> int:
+    s = s.strip().lower()
+    if s.endswith("h"):
+        return int(float(s[:-1]) * 3600)
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 60)
+    if s.endswith("s"):
+        return int(float(s[:-1]))
+    return int(s)
+
+
+def jobs_table_md(jobs: list[ResearchJobState]) -> str:
+    if not jobs:
+        return "*No jobs yet.*"
+    rows = ["| Job ID | Status | Phase | Cycle | Score | Objective |",
+            "|--------|--------|-------|-------|-------|-----------|"]
+    for j in jobs:
+        obj = (j.spec.objective[:38] + "…") if len(j.spec.objective) > 38 else j.spec.objective
+        rows.append(
+            f"| `{j.job_id}` | {j.status} | {j.phase} "
+            f"| {j.cycle} | {j.metrics.overall:.2f} | {obj} |"
+        )
+    return "\n".join(rows)
+
+
+def job_detail_md(state: ResearchJobState | None) -> str:
+    if state is None:
+        return "*Select a job from the table above.*"
+    lines = [
+        f"**Job:** `{state.job_id}`",
+        f"**Status:** {state.status}  |  **Phase:** {state.phase}  |  **Cycle:** {state.cycle}",
+        f"**Score:** grounding={state.metrics.grounding:.2f}  coverage={state.metrics.coverage:.2f}"
+        f"  clarity={state.metrics.clarity:.2f}  overall={state.metrics.overall:.2f}",
+        f"**Deadline:** {state.spec.deadline_at[:19]}",
+        f"**Created:** {state.created_at[:19]}",
+    ]
+    if state.finished_at:
+        lines.append(f"**Finished:** {state.finished_at[:19]}")
+    if state.blocked:
+        lines.append(f"\n**Blocked:** {state.blocked.kind.upper()} at `{state.blocked.url}`")
+        lines.append(f"> {state.blocked.message}")
+    return "\n\n".join(lines)
+
+
+def events_text(store: JobStore, job_id: str) -> str:
+    evs = store.tail_events(job_id, n=30)
+    if not evs:
+        return "(no events yet)"
+    lines = []
+    for ev in evs:
+        ts = ev.get("ts", "")[:19]
+        event = ev.get("event", "?")
+        rest = {k: v for k, v in ev.items() if k not in ("ts", "event")}
+        suffix = "  " + json.dumps(rest) if rest else ""
+        lines.append(f"{ts}  {event}{suffix}")
+    return "\n".join(lines)
 
 DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 DEFAULT_WORKDIR = "./runtime"
@@ -508,13 +603,16 @@ background: radial-gradient(circle at top right, rgba(212,180,93,.08), transpare
 def build_demo() -> gr.Blocks:
     with gr.Blocks() as demo:
         app_state = gr.State(fresh_state(DEFAULT_WORKDIR))
+        # jobs UI state: selected job_id
+        selected_job_id = gr.State(None)
 
         gr.Markdown(
-            "<div id='hero'><h1>Emy</h1><p>Gradio UI for the current orchestrator. Cleaner workflow, staged attachments, session history, and runtime tools.</p></div>"
+            "<div id='hero'><h1>Emy</h1><p>Memory-first research assistant — chat, knowledge studio, and autonomous research jobs.</p></div>"
         )
 
+        # ── shared runtime config (visible on all tabs) ───────────────
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=1, min_width=260):
                 with gr.Group(elem_classes="panel"):
                     gr.Markdown("### Runtime")
                     base_url = gr.Textbox(label="Ollama base URL", value=DEFAULT_OLLAMA_BASE_URL)
@@ -525,43 +623,122 @@ def build_demo() -> gr.Blocks:
                     apply_btn = gr.Button("Apply runtime", variant="primary")
                     status_md = gr.Markdown()
 
-                with gr.Group(elem_classes="panel"):
-                    gr.Markdown("### Chats")
-                    session_picker = gr.Radio(label="History", choices=[], value=None)
-                    with gr.Row():
-                        new_btn = gr.Button("New chat")
-                        del_btn = gr.Button("Delete chat")
-                    recent_md = gr.Markdown("*No recent attachments.*")
+            with gr.Column(scale=4):
+                with gr.Tabs():
 
-                with gr.Accordion("Knowledge Studio", open=False):
-                    ingest_files_box = gr.File(label="Upload files to ingest", file_count="multiple", file_types=UPLOAD_TYPES, type="filepath")
-                    ingest_folder = gr.Textbox(label="Or ingest a local folder", value="./data/sample_docs")
-                    ingest_btn = gr.Button("Ingest")
-                    fact_cat = gr.Textbox(label="Fact category", value="preferences")
-                    fact_content = gr.Textbox(label="Fact content", lines=2)
-                    fact_btn = gr.Button("Save fact")
-                    refl_text = gr.Textbox(label="Reflection", lines=2)
-                    refl_btn = gr.Button("Save reflection")
-                    ex_text = gr.Textbox(label="Training text")
-                    ex_label = gr.Textbox(label="Intent label")
-                    ex_btn = gr.Button("Save training example")
-                    ent_name = gr.Textbox(label="Entity name")
-                    ent_type = gr.Textbox(label="Entity type")
-                    ent_desc = gr.Textbox(label="Entity description", lines=2)
-                    ent_btn = gr.Button("Save entity")
-                    status_btn = gr.Button("System status")
-                    status_json = gr.Code(label="Status", language="json")
+                    # ── Tab 1: Chat ───────────────────────────────────
+                    with gr.TabItem("Chat"):
+                        with gr.Row():
+                            with gr.Column(scale=1):
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Chats")
+                                    session_picker = gr.Radio(label="History", choices=[], value=None)
+                                    with gr.Row():
+                                        new_btn = gr.Button("New chat")
+                                        del_btn = gr.Button("Delete chat")
+                                    recent_md = gr.Markdown("*No recent attachments.*")
 
-            with gr.Column(scale=3):
-                with gr.Group(elem_classes="panel"):
-                    chat = gr.Chatbot(label="Conversation", height=620)
-                    pending_md = gr.Markdown("*No pending files.*")
-                    staged_files = gr.File(label="Attach files for next message", file_count="multiple", file_types=UPLOAD_TYPES, type="filepath")
-                    with gr.Row():
-                        msg = gr.Textbox(label="Message", placeholder="Message Emy…", scale=8)
-                        send_btn = gr.Button("Send", variant="primary", scale=1)
-                        clear_btn = gr.Button("Clear files", scale=1)
+                                with gr.Accordion("Knowledge Studio", open=False):
+                                    ingest_files_box = gr.File(label="Upload files to ingest", file_count="multiple", file_types=UPLOAD_TYPES, type="filepath")
+                                    ingest_folder = gr.Textbox(label="Or ingest a local folder", value="./data/sample_docs")
+                                    ingest_btn = gr.Button("Ingest")
+                                    fact_cat = gr.Textbox(label="Fact category", value="preferences")
+                                    fact_content = gr.Textbox(label="Fact content", lines=2)
+                                    fact_btn = gr.Button("Save fact")
+                                    refl_text = gr.Textbox(label="Reflection", lines=2)
+                                    refl_btn = gr.Button("Save reflection")
+                                    ex_text = gr.Textbox(label="Training text")
+                                    ex_label = gr.Textbox(label="Intent label")
+                                    ex_btn = gr.Button("Save training example")
+                                    ent_name = gr.Textbox(label="Entity name")
+                                    ent_type = gr.Textbox(label="Entity type")
+                                    ent_desc = gr.Textbox(label="Entity description", lines=2)
+                                    ent_btn = gr.Button("Save entity")
+                                    status_btn = gr.Button("System status")
+                                    status_json = gr.Code(label="Status", language="json")
 
+                            with gr.Column(scale=3):
+                                with gr.Group(elem_classes="panel"):
+                                    chat = gr.Chatbot(label="Conversation", height=560)
+                                    pending_md = gr.Markdown("*No pending files.*")
+                                    staged_files = gr.File(label="Attach files for next message", file_count="multiple", file_types=UPLOAD_TYPES, type="filepath")
+                                    with gr.Row():
+                                        msg = gr.Textbox(label="Message", placeholder="Message Emy…", scale=8)
+                                        send_btn = gr.Button("Send", variant="primary", scale=1)
+                                        clear_btn = gr.Button("Clear files", scale=1)
+
+                    # ── Tab 2: Research Jobs ──────────────────────────
+                    with gr.TabItem("Research Jobs"):
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Create Research Job")
+                                    job_objective = gr.Textbox(label="Objective", lines=3,
+                                        placeholder="Research and write a report on …")
+                                    with gr.Row():
+                                        job_deliverable = gr.Dropdown(
+                                            label="Deliverable",
+                                            choices=["markdown_report", "brief", "memo"],
+                                            value="markdown_report",
+                                        )
+                                        job_budget = gr.Textbox(label="Time budget", value="1h",
+                                            placeholder="2h / 30m / 3600s")
+                                    with gr.Accordion("Model overrides (optional)", open=False):
+                                        job_planner_model   = gr.Textbox(label="Planner model")
+                                        job_researcher_model = gr.Textbox(label="Researcher model")
+                                        job_writer_model    = gr.Textbox(label="Writer model")
+                                        job_critic_model    = gr.Textbox(label="Critic model")
+                                    with gr.Row():
+                                        job_queue_btn = gr.Button("Queue job", variant="primary")
+                                        job_run_btn   = gr.Button("Run now (background thread)")
+                                    job_create_status = gr.Markdown()
+
+                            with gr.Column(scale=3):
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Job List")
+                                    with gr.Row():
+                                        jobs_refresh_btn = gr.Button("Refresh")
+                                        jobs_status_filter = gr.Dropdown(
+                                            label="Filter",
+                                            choices=["", "queued", "running", "paused",
+                                                     "blocked", "completed", "failed",
+                                                     "canceled", "expired"],
+                                            value="",
+                                        )
+                                    jobs_table = gr.Markdown("*No jobs yet.*")
+
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Selected Job")
+                                    job_id_input = gr.Textbox(label="Job ID", placeholder="job_xxxxxxxx")
+                                    with gr.Row():
+                                        job_select_btn  = gr.Button("Load")
+                                        job_cancel_btn  = gr.Button("Cancel")
+                                        job_resume_btn  = gr.Button("Resume")
+                                        job_refresh_btn = gr.Button("Refresh status")
+                                    job_detail = gr.Markdown("*Enter a job ID and click Load.*")
+
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Intervention (when blocked)")
+                                    intervention_md = gr.Markdown("*No active intervention.*")
+                                    manual_content = gr.Textbox(label="Paste manually fetched content", lines=5)
+                                    with gr.Row():
+                                        resolve_btn = gr.Button("Submit & Resume", variant="primary")
+                                        skip_btn    = gr.Button("Skip blocked source")
+                                    intervention_status = gr.Markdown()
+
+                            with gr.Column(scale=3):
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Events log")
+                                    events_box = gr.Code(label="", language=None, lines=20)
+                                    events_refresh_btn = gr.Button("Refresh events")
+                                with gr.Group(elem_classes="panel"):
+                                    gr.Markdown("### Report preview")
+                                    report_preview = gr.Markdown("*Load a job to preview its report.*")
+                                    report_refresh_btn = gr.Button("Refresh report")
+
+        # ── Chat event wiring ─────────────────────────────────────────
         demo.load(
             apply_runtime,
             inputs=[base_url, workdir, learning, vision],
@@ -581,6 +758,195 @@ def build_demo() -> gr.Blocks:
         ex_btn.click(add_example, [ex_text, ex_label, base_url, workdir, learning, vision, app_state], [status_md])
         ent_btn.click(add_entity, [ent_name, ent_type, ent_desc, base_url, workdir, learning, vision, app_state], [status_md])
         status_btn.click(system_status, [base_url, workdir, learning, vision], [status_json])
+
+        # ── Research Jobs event wiring ────────────────────────────────
+
+        def _create_job(objective, deliverable, budget, planner_m, researcher_m, writer_m, critic_m, workdir_val, base_url_val, learning_val, vision_val):
+            if not objective.strip():
+                return "Please enter an objective.", None, jobs_table_md([])
+            try:
+                budget_s = _parse_time_budget_ui(budget)
+            except Exception:
+                return f"Invalid time budget: {budget!r}", None, jobs_table_md([])
+            ensure_job_worker(workdir_val, base_url_val, learning_val, vision_val)
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=budget_s)
+            models = {}
+            for role, val in [("planner", planner_m), ("researcher", researcher_m),
+                               ("writer", writer_m), ("critic", critic_m)]:
+                if (val or "").strip():
+                    models[role] = val.strip()
+            spec = ResearchJobSpec(
+                objective=objective.strip(),
+                deliverable_type=deliverable,
+                deadline_at=deadline.isoformat(),
+                time_budget_s=budget_s,
+                models=models,
+            )
+            job_id = new_id("job")
+            state = ResearchJobState(job_id=job_id, spec=spec, created_at=now_iso())
+            store = get_job_store(workdir_val)
+            store.save(state)
+            store.append_event(job_id, {"event": "job_created", "objective": objective.strip()[:120]})
+            all_jobs = store.list_jobs()
+            return f"Job created: `{job_id}`", job_id, jobs_table_md(all_jobs)
+
+        def _queue_job(objective, deliverable, budget, planner_m, researcher_m, writer_m, critic_m, workdir_val, base_url_val, learning_val, vision_val):
+            msg_out, jid, table = _create_job(objective, deliverable, budget, planner_m, researcher_m, writer_m, critic_m, workdir_val, base_url_val, learning_val, vision_val)
+            return msg_out, table
+
+        def _run_job_now(objective, deliverable, budget, planner_m, researcher_m, writer_m, critic_m, workdir_val, base_url_val, learning_val, vision_val):
+            msg_out, jid, table = _create_job(objective, deliverable, budget, planner_m, researcher_m, writer_m, critic_m, workdir_val, base_url_val, learning_val, vision_val)
+            if jid is None:
+                return msg_out, table
+            # Run in a daemon thread so the UI stays responsive
+            def _run():
+                emy = get_emy(base_url_val, workdir_val, learning_val, vision_val)
+                store = get_job_store(workdir_val)
+                try:
+                    state = store.load(jid)
+                    runner = ResearchJobRunner(llm=emy.llm, tools=emy.tools, store=store, config=emy.config)
+                    runner.run_until_done(state)
+                except Exception as exc:
+                    try:
+                        state = store.load(jid)
+                        state.status = "failed"
+                        store.save(state)
+                        store.append_event(jid, {"event": "job_failed", "error": str(exc)})
+                    except Exception:
+                        pass
+            threading.Thread(target=_run, daemon=True, name=f"emy-job-{jid}").start()
+            return f"Job `{jid}` started in background thread.", table
+
+        def _refresh_jobs(status_filter, workdir_val):
+            store = get_job_store(workdir_val)
+            jobs = store.list_jobs(status=status_filter or None)
+            return jobs_table_md(jobs)
+
+        def _load_job(job_id_val, workdir_val):
+            if not job_id_val.strip():
+                return "Enter a job ID.", "", "", "*Load a job to preview its report.*", None
+            store = get_job_store(workdir_val)
+            try:
+                state = store.load(job_id_val.strip())
+            except FileNotFoundError:
+                return f"Job `{job_id_val}` not found.", "", "", "*Job not found.*", None
+            detail = job_detail_md(state)
+            evs = events_text(store, state.job_id)
+            report = store.read_artifact(state.job_id, "report.md") or "*No report yet.*"
+            iv_md = "*No active intervention.*"
+            if state.blocked:
+                iv_md = (f"**{state.blocked.kind.upper()}** at `{state.blocked.url}`\n\n"
+                         f"{state.blocked.message}")
+            return detail, evs, iv_md, report, state.job_id
+
+        def _cancel_job(job_id_val, workdir_val):
+            if not job_id_val.strip():
+                return "Enter a job ID.", "", ""
+            store = get_job_store(workdir_val)
+            try:
+                state = store.load(job_id_val.strip())
+            except FileNotFoundError:
+                return f"Job `{job_id_val}` not found.", "", ""
+            if state.status in ("completed", "failed", "canceled", "expired"):
+                return f"Already in terminal state: {state.status}", job_detail_md(state), ""
+            state.status = "canceled"
+            state.finished_at = now_iso()
+            store.save(state)
+            store.append_event(job_id_val.strip(), {"event": "job_canceled", "source": "ui"})
+            state = store.load(job_id_val.strip())
+            return "Job canceled.", job_detail_md(state), events_text(store, job_id_val.strip())
+
+        def _resume_job(job_id_val, workdir_val):
+            if not job_id_val.strip():
+                return "Enter a job ID.", "", ""
+            store = get_job_store(workdir_val)
+            try:
+                state = store.load(job_id_val.strip())
+            except FileNotFoundError:
+                return f"Job `{job_id_val}` not found.", "", ""
+            if state.status not in ("paused", "blocked"):
+                return f"Job is {state.status!r}, cannot resume.", job_detail_md(state), ""
+            state.status = "queued"
+            state.blocked = None
+            store.save(state)
+            store.append_event(job_id_val.strip(), {"event": "job_requeued", "source": "ui"})
+            state = store.load(job_id_val.strip())
+            return "Job re-queued.", job_detail_md(state), events_text(store, job_id_val.strip())
+
+        def _refresh_job_status(job_id_val, workdir_val):
+            if not job_id_val:
+                return "*No job selected.*", "", "*No active intervention.*", "*Load a job to preview its report.*"
+            store = get_job_store(workdir_val)
+            try:
+                state = store.load(job_id_val)
+            except FileNotFoundError:
+                return f"Job `{job_id_val}` not found.", "", "*No active intervention.*", "*Job not found.*"
+            iv_md = "*No active intervention.*"
+            if state.blocked:
+                iv_md = (f"**{state.blocked.kind.upper()}** at `{state.blocked.url}`\n\n"
+                         f"{state.blocked.message}")
+            report = store.read_artifact(state.job_id, "report.md") or "*No report yet.*"
+            return job_detail_md(state), events_text(store, job_id_val), iv_md, report
+
+        def _resolve_intervention(job_id_val, manual_text, workdir_val, skip: bool = False):
+            if not job_id_val:
+                return "No job selected."
+            store = get_job_store(workdir_val)
+            try:
+                state = store.load(job_id_val)
+            except FileNotFoundError:
+                return f"Job `{job_id_val}` not found."
+            if state.status != "blocked":
+                return f"Job is {state.status!r}, not blocked."
+            if manual_text and manual_text.strip():
+                store.save_attachment(job_id_val, "manual_evidence.txt", manual_text.strip())
+                store.append_event(job_id_val, {"event": "attachment_uploaded", "file": "manual_evidence.txt"})
+            action = "skipped" if skip else "resolved"
+            store.append_event(job_id_val, {"event": f"intervention_{action}", "source": "ui"})
+            state.status = "queued"
+            state.blocked = None
+            store.save(state)
+            return f"Intervention {action}. Job re-queued."
+
+        _job_create_inputs = [
+            job_objective, job_deliverable, job_budget,
+            job_planner_model, job_researcher_model, job_writer_model, job_critic_model,
+            workdir, base_url, learning, vision,
+        ]
+        job_queue_btn.click(_queue_job, _job_create_inputs, [job_create_status, jobs_table])
+        job_run_btn.click(_run_job_now, _job_create_inputs, [job_create_status, jobs_table])
+        jobs_refresh_btn.click(_refresh_jobs, [jobs_status_filter, workdir], [jobs_table])
+        jobs_status_filter.change(_refresh_jobs, [jobs_status_filter, workdir], [jobs_table])
+
+        job_select_btn.click(
+            _load_job, [job_id_input, workdir],
+            [job_detail, events_box, intervention_md, report_preview, selected_job_id],
+        )
+        job_cancel_btn.click(_cancel_job, [job_id_input, workdir], [job_create_status, job_detail, events_box])
+        job_resume_btn.click(_resume_job, [job_id_input, workdir], [job_create_status, job_detail, events_box])
+        job_refresh_btn.click(
+            _refresh_job_status, [selected_job_id, workdir],
+            [job_detail, events_box, intervention_md, report_preview],
+        )
+        events_refresh_btn.click(
+            _refresh_job_status, [selected_job_id, workdir],
+            [job_detail, events_box, intervention_md, report_preview],
+        )
+        report_refresh_btn.click(
+            _refresh_job_status, [selected_job_id, workdir],
+            [job_detail, events_box, intervention_md, report_preview],
+        )
+        resolve_btn.click(
+            lambda jid, content, wd: _resolve_intervention(jid, content, wd, skip=False),
+            [selected_job_id, manual_content, workdir],
+            [intervention_status],
+        )
+        skip_btn.click(
+            lambda jid, content, wd: _resolve_intervention(jid, content, wd, skip=True),
+            [selected_job_id, manual_content, workdir],
+            [intervention_status],
+        )
+
     return demo
 
 
