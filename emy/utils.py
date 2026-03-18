@@ -19,9 +19,23 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def append_jsonl(path: Path, item: dict) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+def _sanitize(obj):
+    if isinstance(obj, bytes):
+        return f"<{len(obj)} bytes>"
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
+def append_jsonl(path, item):
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    clean = _sanitize(item)
+
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(clean, ensure_ascii=False) + "\n")
 
 
 def read_jsonl(path: Path) -> list[dict]:
