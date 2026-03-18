@@ -255,7 +255,30 @@ def load_sessions(workdir: str) -> dict[str, dict[str, Any]]:
 def save_sessions(workdir: str, sessions: dict[str, dict[str, Any]]) -> None:
     path = sessions_path(workdir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"saved_at": utc_now_iso(), "sessions": sessions}, indent=2), encoding="utf-8")
+
+    # Remove raw file bytes before saving
+    cleaned_sessions = {}
+
+    for sid, sess in sessions.items():
+        sess_copy = dict(sess)
+
+        if "recent_attachments" in sess_copy:
+            cleaned = []
+            for item in sess_copy["recent_attachments"]:
+                item_copy = dict(item)
+                item_copy.pop("data", None)  # remove bytes
+                cleaned.append(item_copy)
+            sess_copy["recent_attachments"] = cleaned
+
+        cleaned_sessions[sid] = sess_copy
+
+    path.write_text(
+        json.dumps(
+            {"saved_at": utc_now_iso(), "sessions": cleaned_sessions},
+            indent=2
+        ),
+        encoding="utf-8"
+    )
 
 
 def fresh_state(workdir: str) -> dict[str, Any]:
@@ -591,15 +614,6 @@ def system_status(base_url: str, workdir: str, learning_enabled: bool, vision_en
     return json.dumps(emy.status(), indent=2, ensure_ascii=False)
 
 
-CSS = """
-.gradio-container {max-width: 1500px !important; background: linear-gradient(180deg,#0b0f17,#101522) !important;}
-.block, .panel {border: 1px solid rgba(212,180,93,.14); border-radius: 16px; background: rgba(20,24,36,.88);}
-#hero {padding: 18px 20px; border: 1px solid rgba(212,180,93,.18); border-radius: 18px; margin-bottom: 12px;
-background: radial-gradient(circle at top right, rgba(212,180,93,.08), transparent 30%), linear-gradient(180deg,#121826,#0f1421);}
-#hero h1 {margin: 0; color: #e5c56b;} #hero p {margin: 6px 0 0; color: #b8c0cf;}
-"""
-
-
 def build_demo() -> gr.Blocks:
     with gr.Blocks() as demo:
         app_state = gr.State(fresh_state(DEFAULT_WORKDIR))
@@ -659,7 +673,7 @@ def build_demo() -> gr.Blocks:
 
                             with gr.Column(scale=3):
                                 with gr.Group(elem_classes="panel"):
-                                    chat = gr.Chatbot(label="Conversation", height=560)
+                                    chat = gr.Chatbot(label="Conversation", height=560, type="messages")
                                     pending_md = gr.Markdown("*No pending files.*")
                                     staged_files = gr.File(label="Attach files for next message", file_count="multiple", file_types=UPLOAD_TYPES, type="filepath")
                                     with gr.Row():
@@ -953,4 +967,4 @@ def build_demo() -> gr.Blocks:
 demo = build_demo()
 
 if __name__ == "__main__":
-    demo.launch(theme=gr.themes.Soft(), css=CSS)
+    demo.launch(share=True,debug=True)
